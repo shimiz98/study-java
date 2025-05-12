@@ -1,0 +1,5 @@
+# https://qiita.com/Yossy_Hal/items/6fe2d14cddd6e16796d7
+* text=auto eol=lf
+*.{cmd,[cC][mM][dD]} text eol=crlf
+*.{bat,[bB][aA][tT]} text eol=crlf
+*png binary

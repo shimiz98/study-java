@@ -1,0 +1,12 @@
+# Eclipse workspace
+/.metadata
+/Servers
+
+# Temporary
+tmp-*
+tmp_*
+*.tmp
+
+# vi
+*.swp
+
