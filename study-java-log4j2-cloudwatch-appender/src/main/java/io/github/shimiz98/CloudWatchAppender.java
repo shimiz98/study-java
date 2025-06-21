@@ -20,6 +20,7 @@ import org.apache.logging.log4j.core.config.plugins.Plugin;
 import org.apache.logging.log4j.core.config.plugins.PluginAttribute;
 import org.apache.logging.log4j.core.config.plugins.PluginConfiguration;
 import org.apache.logging.log4j.core.config.plugins.PluginFactory;
+import org.apache.logging.log4j.core.impl.Log4jLogEvent;
 
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.cloudwatchlogs.CloudWatchLogsClient;
@@ -31,7 +32,10 @@ import software.amazon.awssdk.services.cloudwatchlogs.model.PutLogEventsResponse
 public class CloudWatchAppender extends AbstractAppender {
     // ===== 定数 =====
     private final int CWL_MAX_EVENT_COUNT = 10_000;
-
+    // https://docs.oracle.com/javase/jp/8/docs/api/java/util/concurrent/BlockingQueue.html
+    // コンシューマによって取得されたときに適宜解釈される特殊なend-of-streamまたはpoisonオブジェクトを挿入するという一般的な方法があります。
+    private final LogEvent STOP_SENDER_THREAD_LOG_EVENT = new Log4jLogEvent();
+     
     // ===== static メソッド =====
     // https://logging.apache.org/log4j/2.x/manual/plugins.html#plugin-discovery
     @PluginFactory
@@ -46,7 +50,6 @@ public class CloudWatchAppender extends AbstractAppender {
     private final BlockingQueue<LogEvent> blockingQueue;
     CloudWatchLogsClient cwLogsClient; // TODO junitのためprivateを外したのを戻す
     private Thread logSenderThread;
-    private volatile boolean logSenderThreadStopFlag = false;
 
     private int cfgMaxQueueLength = 999;
     private long cfgMaxDelayNano = 2_000_000_000;
@@ -76,7 +79,6 @@ public class CloudWatchAppender extends AbstractAppender {
     public void start() {
         System.out.printf("===start()===\n", this.getClass().getName());
         super.start();
-        this.logSenderThreadStopFlag = false;
         this.cwLogsClient = newCloudWatchLogsClient();
         this.logSenderThread = newLogSenderThread();
         this.logSenderThread.start();
@@ -85,14 +87,15 @@ public class CloudWatchAppender extends AbstractAppender {
     @Override
     public void stop() {
         System.out.printf("===stop()===\n", this.getClass().getName());
-        this.logSenderThreadStopFlag = true;
-        if (this.logSenderThread != null) {
-            this.logSenderThread.interrupt();
-        }
+        
         try {
-            this.logSenderThread.join(3000); // TODO 適切なタイムアウト値を考える
+            if (this.blockingQueue.offer(STOP_SENDER_THREAD_LOG_EVENT, 1000, TimeUnit.MICROSECONDS)) {
+                System.err.printf("[ERROR} blockingQueue is full: STOP_SENDER_THREAD\n");
+            }
+            this.logSenderThread.join(1000); // TODO offer()とjoin()のそれぞれ最大1秒待ちを、合計で最大1秒待ちにする
+
         } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+            Thread.currentThread().interrupt(); // TODO stop()の仕様的にこれで良いか?
         }
         super.stop();
     }
@@ -113,10 +116,19 @@ public class CloudWatchAppender extends AbstractAppender {
         return t;
     }
 
+    /**
+     * ログ転送する
+     * <ul>
+     *   <li>ログが来たら最大2秒待ち、待っている間に来たログと1個のリクエストにしてCloudWatchへログ転送する
+     *   <li>ただし、1回にCloudWatchにPutLogEventsできる上限を超えたら、直ちにCloudWatchへログ転送する。
+     *   <li>また STOP_SENDER_THREADが来たら、そこまでのログをログ転送してから、returnする。
+     * </ul>
+     */
     void waitAndSendLogs() {
         InputLogEvent nextCwLogEvent = null; // 次にログ転送するログ。初回は無いのでnull。
         long nextSendNanoTime = 0; // 次のログ転送する時刻。System.nanoTime()はゼロになる可能性もあるので、このゼロを判定に使わないこと。
-
+        boolean logSenderThreadStopFlag = false;
+        
         while (logSenderThreadStopFlag == false) {
             List<InputLogEvent> cwLogEvents = new ArrayList<>();
             int cwLogEventsLength = 0;
@@ -141,11 +153,16 @@ public class CloudWatchAppender extends AbstractAppender {
                     logEvent = blockingQueue.poll(timeout, TimeUnit.NANOSECONDS);
                 } catch (InterruptedException e) {
                     // stop()が呼ばれたので、ループを抜けてログ転送してから、returnする
+                    logSenderThreadStopFlag = true; // TODO すぐに return する方が良いか?
                     break;
                 }
                 System.out.printf("===END== blockingQueue.poll()=== %s %s\n", this.getClass().getName(), logEvent);
                 if (logEvent == null) {
                     break; // 時間経過したため、ループを抜けて、ログ転送する
+                }
+                if (logEvent == STOP_SENDER_THREAD_LOG_EVENT) {
+                    logSenderThreadStopFlag = true;
+                    break; // stop()が呼ばれたので、ループを抜けてログ転送してから、returnする
                 }
                 if (cwLogEvents.isEmpty()) {
                     // 次にログ転送する時刻を決める
@@ -155,6 +172,7 @@ public class CloudWatchAppender extends AbstractAppender {
                 InputLogEvent cwLogEvent = newCwLogEvent(logEvent);
 
                 // TODO check 「Each log event can be no larger than 1 MB.」
+                // WANT-TO 1MBを超えた部分は切り捨てと、1MBごとに分割してログ転送を選択可能にする。
 
                 cwLogEventsLength += cwLogEvent.message().length() + 26; // TODO 正確に UTF-8 で計算する
                 if (1_048_576 < cwLogEventsLength) {
@@ -166,15 +184,20 @@ public class CloudWatchAppender extends AbstractAppender {
                 }
                 cwLogEvents.add(cwLogEvent);
             }
-            // CloudWatch へのログ転送する。※ここに書くと長いので別のメソッドに切り出した
-            sendLogs(cwLogEvents); 
+            if (!cwLogEvents.isEmpty()) { // stop()が呼ばれた場合は、emptyの可能性があるので判定する
+                // CloudWatch へのログ転送する。※ここに書くと長いので別のメソッドに切り出した
+                sendLogs(cwLogEvents);
+            }
         }
     }
-    
+
     void sendLogs(List<InputLogEvent> cwLogEvents) {
         PutLogEventsRequest req = PutLogEventsRequest.builder().logGroupName(cfgLogGroupName)
                 .logStreamName(cfgLogStreamName).logEvents(cwLogEvents).build();
-        PutLogEventsResponse res = cwLogsClient.putLogEvents(req); // TODO 10回くらいリトライする
+        PutLogEventsResponse res = cwLogsClient.putLogEvents(req);
+        // TODO 10回くらいリトライする ※ per-second per-account の rate limit と、一時的なネットワーク障害への対処として。
+        // https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_PutLogEvents.html
+        // The quota of five requests per second per log stream has been removed. Instead, PutLogEvents actions are throttled based on a per-second per-account quota. You can request an increase to the per-second throttling quota by using the Service Quotas service.
         if (res.rejectedLogEventsInfo() != null) {
             System.err.printf("[ERROR] CloudWatchClient.PutLogEvents: %s: %s\n", this.getClass().getName(),
                     res);
