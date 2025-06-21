@@ -47,11 +47,11 @@ class CloudWatchAppenderTest {
     void test() throws InterruptedException {
         CloudWatchAppender testTarget = CloudWatchAppender.createAppender(null, "dummy");
 
-        testTarget.logSender.cwlClient = cwLogsClient;
         Mockito.when(cwLogsClient.putLogEvents((PutLogEventsRequest) Mockito.any()))
                 .thenReturn(PutLogEventsResponse.builder().build());
 
         testTarget.start();
+        testTarget.cwLogsClient = cwLogsClient;
         LogEvent log1 = Log4jLogEvent.newBuilder().setTimeMillis(11).setMessage(new SimpleMessage("111"))
                 .setLoggerName("dummy").build();
         testTarget.append(log1);
@@ -60,5 +60,41 @@ class CloudWatchAppenderTest {
         PutLogEventsRequest req = PutLogEventsRequest.builder().logGroupName("myapp-lg").logStreamName("myapp-ls").build();
         Mockito.verify(cwLogsClient, Mockito.times(1)).putLogEvents(
                 req.toBuilder().logEvents(InputLogEvent.builder().timestamp(11L).message("111").build()).build());
+    }
+
+    @Test
+    void testWait() throws InterruptedException {
+        CloudWatchAppender testTarget = CloudWatchAppender.createAppender(null, "dummy");
+
+        Mockito.when(cwLogsClient.putLogEvents((PutLogEventsRequest) Mockito.any()))
+                .thenReturn(PutLogEventsResponse.builder().build());
+
+        Log4jLogEvent baseLog = Log4jLogEvent.newBuilder().setLoggerName("dummy").build();
+
+        int cfgMaxSendDelay = 2000;
+
+        testTarget.start();
+        testTarget.cwLogsClient = cwLogsClient;
+        LogEvent log1 = Log4jLogEvent.newBuilder().setTimeMillis(11).setMessage(new SimpleMessage("111"))
+                .setLoggerName("dummy").build();
+        testTarget.append(log1);
+        testTarget.append(baseLog.asBuilder().setTimeMillis(22).setMessage(new SimpleMessage("222")).build());
+        testTarget.append(baseLog.asBuilder().setTimeMillis(33).setMessage(new SimpleMessage("333")).build());
+        Thread.sleep(cfgMaxSendDelay + 1);
+        testTarget.append(baseLog.asBuilder().setTimeMillis(44).setMessage(new SimpleMessage("444")).build());
+        testTarget.stop();
+
+        PutLogEventsRequest req = PutLogEventsRequest.builder().logGroupName("myapp-lg").logStreamName("myapp-ls")
+                .build();
+        Mockito.verify(cwLogsClient, Mockito.times(1)).putLogEvents(req.toBuilder()
+                .logEvents(newInputLogEvent(11, "111"), newInputLogEvent(22, "222"), newInputLogEvent(33, "333"))
+                .build());
+        Mockito.verify(cwLogsClient, Mockito.times(1)).putLogEvents(req.toBuilder()
+                .logEvents(newInputLogEvent(44, "444"))
+                .build());
+    }
+
+    InputLogEvent newInputLogEvent(long timestamp, String message) {
+        return InputLogEvent.builder().timestamp(timestamp).message(message).build();
     }
 }
