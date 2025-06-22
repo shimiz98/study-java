@@ -9,6 +9,7 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
 
+import org.apache.logging.log4j.core.Appender;
 import org.apache.logging.log4j.core.Filter;
 import org.apache.logging.log4j.core.Layout;
 import org.apache.logging.log4j.core.LogEvent;
@@ -28,7 +29,7 @@ import software.amazon.awssdk.services.cloudwatchlogs.model.InputLogEvent;
 import software.amazon.awssdk.services.cloudwatchlogs.model.PutLogEventsRequest;
 import software.amazon.awssdk.services.cloudwatchlogs.model.PutLogEventsResponse;
 
-@Plugin(name = "CloudWatchAppender", category = Node.CATEGORY)
+@Plugin(name = "CloudWatchAppender", category = Node.CATEGORY, elementType = Appender.ELEMENT_TYPE)
 public class CloudWatchAppender extends AbstractAppender {
     // ===== 定数 =====
     private final int CWL_MAX_EVENT_COUNT = 10_000;
@@ -52,7 +53,11 @@ public class CloudWatchAppender extends AbstractAppender {
     private Thread logSenderThread;
 
     private int cfgMaxQueueLength = 999;
-    private long cfgMaxDelayNano = 2_000_000_000;
+    private long cfgMaxSendDelayNano = 2_000_000_000;
+    private long cfgMaxStopDelay = 1_000;
+    // private long cfgCwMaxCountPerSend = 10_000;
+    // private long cfgCwMaxBytesPerSend
+    // private long cfgCwMaxBytesPerLogEvent
     private String cfgRegionName = "ap-northeast-1";
     // TODO private String cfgEndpointUrl = null;
     private String cfgLogGroupName = "myapp-lg";
@@ -89,10 +94,10 @@ public class CloudWatchAppender extends AbstractAppender {
         System.out.printf("===stop()===\n", this.getClass().getName());
         
         try {
-            if (this.blockingQueue.offer(STOP_SENDER_THREAD_LOG_EVENT, 1000, TimeUnit.MICROSECONDS)) {
+            if (this.blockingQueue.offer(STOP_SENDER_THREAD_LOG_EVENT, cfgMaxStopDelay, TimeUnit.MICROSECONDS)) {
                 System.err.printf("[ERROR} blockingQueue is full: STOP_SENDER_THREAD\n");
             }
-            this.logSenderThread.join(1000); // TODO offer()とjoin()のそれぞれ最大1秒待ちを、合計で最大1秒待ちにする
+            this.logSenderThread.join(cfgMaxStopDelay); // TODO offer()とjoin()のそれぞれ最大1秒待ちを、合計で最大1秒待ちにする
 
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt(); // TODO stop()の仕様的にこれで良いか?
@@ -166,7 +171,7 @@ public class CloudWatchAppender extends AbstractAppender {
                 }
                 if (cwLogEvents.isEmpty()) {
                     // 次にログ転送する時刻を決める
-                    nextSendNanoTime = System.nanoTime() + cfgMaxDelayNano;
+                    nextSendNanoTime = System.nanoTime() + cfgMaxSendDelayNano;
                 }
 
                 InputLogEvent cwLogEvent = newCwLogEvent(logEvent);
@@ -180,6 +185,7 @@ public class CloudWatchAppender extends AbstractAppender {
                     // check 「The maximum batch size is 1,048,576 bytes. UTF-8,plus 26 bytes for
                     // each log event.」
                     nextCwLogEvent = cwLogEvent;
+                    // TODO 次にログ転送する時刻を決める
                     break; // 合計サイズが超過したため、ループを抜けて、ログ転送する
                 }
                 cwLogEvents.add(cwLogEvent);
